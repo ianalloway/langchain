@@ -387,6 +387,59 @@ def create_schema_from_function(
     )
 
 
+def _is_valid_args_schema_annotation(annotation: Any) -> bool:
+    """Check if the args_schema annotation is valid using get_origin/get_args.
+
+    Valid annotations include:
+    - ``Type[SomeBaseModel]``
+    - ``Optional[Type[SomeBaseModel]]``
+    - ``Annotated[Type[BaseModel], ...]``
+    - ``type[SomeBaseModel]``
+    - Direct BaseModel bare class is invalid (must be wrapped in Type[...])
+    - ``None`` or ``NoneType`` alone is valid (means no schema)
+
+    Args:
+        annotation: The type annotation to validate.
+
+    Returns:
+        ``True`` if the annotation is acceptable, ``False`` if it will
+        cause runtime errors (e.g. bare ``BaseModel`` instead of
+        ``Type[BaseModel]``).
+    """
+    if annotation is type(None):
+        return True
+
+    origin = get_origin(annotation)
+
+    if origin is typing.Union:
+        args = get_args(annotation)
+        return all(
+            arg is type(None) or _is_valid_args_schema_annotation(arg)
+            for arg in args
+        )
+
+    if origin in {typing.Annotated, typing_extensions.Annotated}:
+        inner = get_args(annotation)[0]
+        return _is_valid_args_schema_annotation(inner)
+
+    if origin is type:
+        type_args = get_args(annotation)
+        if type_args:
+            return _is_pydantic_annotation(type_args[0]) or type_args[0] is BaseModel
+        return True
+
+    if annotation is BaseModel or annotation is BaseModelV1:
+        return False
+
+    try:
+        if isinstance(annotation, type) and issubclass(annotation, (BaseModel, BaseModelV1)):
+            return False
+    except TypeError:
+        pass
+
+    return True
+
+
 class ToolException(Exception):  # noqa: N818
     """Exception thrown when a tool execution error occurs.
 
@@ -423,25 +476,23 @@ class BaseTool(RunnableSerializable[str | dict | ToolCall, Any]):
 
         args_schema_type = cls.__annotations__.get("args_schema", None)
 
-        if args_schema_type is not None and args_schema_type == BaseModel:
-            # Throw errors for common mis-annotations.
-            # TODO: Use get_args / get_origin and fully
-            # specify valid annotations.
-            typehint_mandate = """
+        if args_schema_type is not None:
+            if not _is_valid_args_schema_annotation(args_schema_type):
+                typehint_mandate = """
 class ChildTool(BaseTool):
     ...
     args_schema: Type[BaseModel] = SchemaClass
     ..."""
-            name = cls.__name__
-            msg = (
-                f"Tool definition for {name} must include valid type annotations"
-                f" for argument 'args_schema' to behave as expected.\n"
-                f"Expected annotation of 'Type[BaseModel]'"
-                f" but got '{args_schema_type}'.\n"
-                f"Expected class looks like:\n"
-                f"{typehint_mandate}"
-            )
-            raise SchemaAnnotationError(msg)
+                name = cls.__name__
+                msg = (
+                    f"Tool definition for {name} must include valid type annotations"
+                    f" for argument 'args_schema' to behave as expected.\n"
+                    f"Expected annotation of 'Type[BaseModel]'"
+                    f" but got '{args_schema_type}'.\n"
+                    f"Expected class looks like:\n"
+                    f"{typehint_mandate}"
+                )
+                raise SchemaAnnotationError(msg)
 
     name: str
     """The unique name of the tool that clearly communicates its purpose."""
